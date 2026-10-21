@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from time import monotonic
 from typing import Any, Optional
 from urllib.parse import urljoin
@@ -97,6 +98,38 @@ def _import_trafilatura() -> Any:
     """Import a PM-prepared dependency; never mutate the runtime environment."""
     import trafilatura
     return trafilatura
+
+
+_TRAFILATURA_REMEDY = (
+    "Install trafilatura into the environment of the RUNNING process — a "
+    "dependency installed into another venv has no effect. Run:\n"
+    "  python -c \"import sys; print(sys.executable)\"\n"
+    "  uv pip install --python <that python> 'trafilatura>=2.0,<3'\n"
+    "  (or: <that python> -m pip install 'trafilatura>=2.0,<3')\n"
+    "No restart needed: the import happens on the next extract."
+)
+
+
+def _find_spec(name: str) -> Any:
+    """Indirection so tests can simulate a missing module without uninstalling it."""
+    import importlib.util
+
+    if name in sys.modules:
+        # An already-imported module wins: find_spec() raises for a module
+        # object without a __spec__ (e.g. a test stub), and a None entry means
+        # the import failed before.
+        return sys.modules[name]
+    return importlib.util.find_spec(name)
+
+
+def _dependency_problem() -> Optional[str]:
+    """Return an actionable diagnostic when trafilatura is missing, else None."""
+    if _find_spec("trafilatura") is not None:
+        return None
+    return (
+        "trafilatura is not installed in the Python running this agent "
+        f"({sys.executable}). {_TRAFILATURA_REMEDY}"
+    )
 
 
 def _make_client() -> Any:
@@ -335,9 +368,8 @@ def _extract_one(url: str, format: Optional[str]) -> dict[str, Any]:
             "title": "",
             "content": "",
             "raw_content": "",
-            "error": (
-                "trafilatura is unavailable; prepare the plugin dependencies through PM: "
-                f"{exc}"
+            "error": _dependency_problem() or (
+                f"trafilatura import failed in {sys.executable}: {exc}"
             ),
         }
 
@@ -397,13 +429,18 @@ class LocalWebSearchProvider(WebSearchProvider):
         return "Local (httpx + trafilatura)"
 
     def is_available(self) -> bool:
-        """Report actual dependency availability, never an intended installation."""
-        try:
-            import trafilatura
+        """Report actual dependency availability, never an intended installation.
 
-            return True
+        The probe answers "is it installed"; the import answers "does it work".
+        A present-but-broken install must not be advertised as available.
+        """
+        if _dependency_problem() is not None:
+            return False
+        try:
+            _import_trafilatura()
         except ImportError:
             return False
+        return True
 
     def supports_search(self) -> bool:
         return False
@@ -430,6 +467,22 @@ class LocalWebSearchProvider(WebSearchProvider):
         if _is_interrupted():
             return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
 
+        # A missing dependency is a packaging problem, not a per-URL one: report
+        # it before any network access instead of fetching and failing later.
+        problem = _dependency_problem()
+        if problem is not None:
+            logger.error("Local extract unavailable: %s", problem)
+            return [
+                {
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": problem,
+                }
+                for url in urls
+            ]
+
         format = kwargs.get("format")
         results: list[dict[str, Any]] = []
         loop = asyncio.get_running_loop()
@@ -443,8 +496,20 @@ class LocalWebSearchProvider(WebSearchProvider):
 
             logger.info("Local extract: %s", url)
             timeout = _EXTRACT_TIMEOUT_SECS
+            budget_limited = False
             if deadline is not None:
-                timeout = min(timeout, deadline - loop.time())
+                remaining = deadline - loop.time()
+                if remaining < timeout:
+                    # The batch deadline ends this wait, not the per-URL cap:
+                    # the page never got its full allowance.
+                    timeout = remaining
+                    budget_limited = True
+            # Decide the reason BEFORE waiting: comparing the timeout
+            # afterwards mislabels a clamped wait as a per-URL timeout.
+            if budget_limited:
+                reason = f"Extract batch time budget exhausted ({budget:g}s)"
+            else:
+                reason = f"Extract timed out after {_EXTRACT_TIMEOUT_SECS}s"
             try:
                 if timeout <= 0:
                     raise TimeoutError
@@ -454,9 +519,6 @@ class LocalWebSearchProvider(WebSearchProvider):
                 )
             except TimeoutError:
                 logger.warning("Local extract timed out for %s", url)
-                reason = (f"Extract timed out after {_EXTRACT_TIMEOUT_SECS}s"
-                          if timeout == _EXTRACT_TIMEOUT_SECS
-                          else f"Extract batch time budget exhausted ({budget:.0f}s)")
                 item = {
                     "url": url,
                     "title": "",

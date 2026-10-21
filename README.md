@@ -39,6 +39,37 @@ can be picked for search.
   `fetch_url` is never called). `text/plain` is returned as is. An unknown charset
   falls back to UTF-8 instead of failing.
 
+## Troubleshooting: `trafilatura is unavailable`
+
+The plugin declares `trafilatura` in `plugin.yaml`, but that only records the
+requirement — it does not install it into the environment your agent process is
+running. A Hermes install can hold several `environments/*/venv` directories, and
+`hermes pm repair` repairs the *recorded* one, which is not necessarily the one
+the running gateway uses. Symptom: `hermes pm repair` prints
+"dependency environment repaired" and every extract still fails.
+
+Find the interpreter that actually matters, then install into it:
+
+```bash
+# the interpreter of the running process
+python -c "import sys; print(sys.executable)"
+
+# every env on the box, to see which one lacks the module
+for v in ~/.hermes/installs/*/environments/*/venv; do
+  printf '%s: ' "$v"; "$v/bin/python" -c "import trafilatura; print('ok')" 2>&1 | tail -1
+done
+
+# uv-managed venvs usually have no pip
+uv pip install --python <that python> 'trafilatura>=2.0,<3'
+# or, in a venv with pip
+<that python> -m pip install 'trafilatura>=2.0,<3'
+```
+
+No restart is needed for a pure-Python dependency: the next extract imports it.
+Since core silently falls back to a keyless extractor when a backend fails, check
+`~/.hermes/logs/errors.log` for `keyless rescue` to be sure the plugin was the one
+that served the page.
+
 ## Tests
 
 Run with the Python of a Hermes install, so that `agent` and `tools` can be imported. You can also
